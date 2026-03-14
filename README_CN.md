@@ -294,6 +294,29 @@ Query → BM25 FTS ─────┘
 - 混合评分：60% cross-encoder + 40% 原始融合分
 - 降级策略：API 失败时回退到 cosine similarity rerank
 
+#### 自适应重排（Adaptive Reranking）
+
+跨编码器每次需要对每条候选记忆分别调用 API，候选数量多时延迟明显。当排名结果已经足够清晰时，重排往往改变不了最终 top-k。
+
+开启 `rerankAdaptive: true` 后，系统在触发重排前会先做两项检查：
+
+| 检查 | 逻辑 | 结果 |
+|------|------|------|
+| **分数方差低** | 候选分数相近（variance < `rerankVarianceThreshold`），RRF 排名不可靠 | **触发**重排 |
+| **查询复杂** | 词数 >= `rerankComplexityWordThreshold`，多维意图需要跨注意力打分 | **触发**重排 |
+| 两项均不满足 | top-1 分数明显领先且查询简单 | **跳过**重排，直接返回 |
+
+```json
+"retrieval": {
+  "rerank": "cross-encoder",
+  "rerankAdaptive": true,
+  "rerankVarianceThreshold": 0.04,
+  "rerankComplexityWordThreshold": 8
+}
+```
+
+> 默认 `rerankAdaptive: false`，行为与旧版完全一致。建议记忆库较大或对延迟敏感时开启。
+
 ### 多层评分管线
 
 | 阶段 | 效果 |

@@ -193,6 +193,25 @@
             "default": "jina",
             "description": "Reranker provider format. Determines request/response shape and auth header. Use tei for Hugging Face Text Embeddings Inference /rerank endpoints. DashScope uses gte-rerank-v2 with endpoint https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank."
           },
+          "rerankAdaptive": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable adaptive reranking. When true, the cross-encoder is only invoked when candidate scores are ambiguous (low variance) OR the query is complex (many words). Skipping unnecessary rerank calls reduces latency and API cost. Default: false (always rerank)."
+          },
+          "rerankVarianceThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.04,
+            "description": "Score variance threshold for adaptive reranking. If the variance of fused candidate scores is below this value, scores are too similar to distinguish and the cross-encoder is triggered. If variance is above (top result clearly leads), reranking is skipped. Set to 0 to disable variance-based triggering. Only used when rerankAdaptive is true."
+          },
+          "rerankComplexityWordThreshold": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "default": 8,
+            "description": "Query word-count threshold for adaptive reranking. Queries with this many words or more are treated as complex and always trigger the cross-encoder regardless of score variance. Set to 0 to disable complexity-based triggering. Only used when rerankAdaptive is true."
+          },
           "candidatePoolSize": {
             "type": "integer",
             "minimum": 10,
@@ -611,6 +630,21 @@
     "retrieval.rerankProvider": {
       "label": "Reranker Provider",
       "help": "Provider format: jina (default), siliconflow, voyage, pinecone, dashscope, or tei",
+      "advanced": true
+    },
+    "retrieval.rerankAdaptive": {
+      "label": "Adaptive Reranking",
+      "help": "Skip cross-encoder when top result is clearly dominant (high score variance) and query is short. Reduces latency and API cost.",
+      "advanced": true
+    },
+    "retrieval.rerankVarianceThreshold": {
+      "label": "Rerank Variance Threshold",
+      "help": "Trigger cross-encoder when candidate score variance is below this value (scores are ambiguous). Only used when Adaptive Reranking is enabled.",
+      "advanced": true
+    },
+    "retrieval.rerankComplexityWordThreshold": {
+      "label": "Rerank Complexity Word Threshold",
+      "help": "Always trigger cross-encoder for queries with this many words or more (complex queries). Only used when Adaptive Reranking is enabled.",
       "advanced": true
     },
     "retrieval.candidatePoolSize": {

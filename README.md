@@ -294,6 +294,29 @@ Query → BM25 FTS ─────┘
 - Hybrid scoring: 60% cross-encoder + 40% original fused score
 - Graceful degradation: falls back to cosine similarity on API failure
 
+#### Adaptive Reranking
+
+The cross-encoder must score every candidate individually, which adds latency when the pool is large. When the ranking is already clear from RRF alone, reranking changes nothing.
+
+Enable `rerankAdaptive: true` to gate the cross-encoder behind two checks:
+
+| Check | Logic | Decision |
+|-------|-------|----------|
+| **Low score variance** | Candidate scores are close (variance < `rerankVarianceThreshold`) — RRF cannot reliably break ties | **Trigger** rerank |
+| **Complex query** | Word count >= `rerankComplexityWordThreshold` — multi-facet intent benefits from cross-attention scoring | **Trigger** rerank |
+| Neither condition met | Top result is clearly dominant and query is short/simple | **Skip** rerank |
+
+```json
+"retrieval": {
+  "rerank": "cross-encoder",
+  "rerankAdaptive": true,
+  "rerankVarianceThreshold": 0.04,
+  "rerankComplexityWordThreshold": 8
+}
+```
+
+> `rerankAdaptive` defaults to `false` for full backward compatibility. Enable it when your memory store is large or latency matters.
+
 ### Multi-Stage Scoring Pipeline
 
 | Stage | Effect |

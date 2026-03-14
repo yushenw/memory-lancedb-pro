@@ -57,6 +57,38 @@ export interface RetrievalConfig {
     | "dashscope"
     | "tei";
   /**
+   * Adaptive reranking: skip cross-encoder when it is unlikely to change the
+   * final top-k, saving latency and API cost.
+   *
+   * When enabled, the reranker fires only when EITHER condition is true:
+   *   1. Score variance is LOW  — candidates have similar RRF scores, so
+   *      cross-encoder precision is needed to break ties.
+   *   2. Query is COMPLEX       — many words suggest multi-facet intent that
+   *      cross-encoder handles better than vector similarity alone.
+   *
+   * When both thresholds are met in the other direction (high variance AND
+   * simple query), the top result is already clearly dominant and reranking
+   * is skipped. Falls back to the existing lightweight cosine rerank path.
+   *
+   * Default: false (always rerank, backward-compatible).
+   */
+  rerankAdaptive?: boolean;
+  /**
+   * Score variance threshold for adaptive reranking (default: 0.04).
+   * Variance is computed over the fused candidate scores BEFORE reranking.
+   * - variance < threshold  → scores are ambiguous → trigger cross-encoder
+   * - variance >= threshold → top result clearly leads → skip cross-encoder
+   * Set to 0 to disable variance-based triggering.
+   */
+  rerankVarianceThreshold?: number;
+  /**
+   * Query word-count threshold for adaptive reranking (default: 8).
+   * Queries with >= this many words are treated as complex and always trigger
+   * the cross-encoder regardless of score variance.
+   * Set to 0 to disable complexity-based triggering.
+   */
+  rerankComplexityWordThreshold?: number;
+  /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
    * anchor = reference length (default: 500 chars). Entries shorter than anchor
@@ -126,6 +158,9 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   reinforcementFactor: 0.5,
   maxHalfLifeMultiplier: 3,
+  rerankAdaptive: false,
+  rerankVarianceThreshold: 0.04,
+  rerankComplexityWordThreshold: 8,
 };
 
 // ============================================================================
@@ -145,6 +180,63 @@ function clamp01(value: number, fallback: number): number {
 function clamp01WithFloor(value: number, floor: number): number {
   const safeFloor = clamp01(floor, 0);
   return Math.max(safeFloor, clamp01(value, safeFloor));
+}
+
+/**
+ * Decide whether to fire the cross-encoder reranker for a given query and
+ * candidate set.
+ *
+ * The cross-encoder is most valuable when:
+ *   - Candidate scores are CLOSE together (low variance) — RRF alone cannot
+ *     reliably break ties, so the richer cross-attention scoring matters.
+ *   - The query is COMPLEX (many words) — multi-facet intent is hard for
+ *     pure vector similarity to capture.
+ *
+ * Conversely, when the top result has a clearly higher score (high variance)
+ * AND the query is short/simple, reranking is unlikely to change top-k and
+ * can be skipped to save latency and API cost.
+ *
+ * Returns `{ trigger: true }` when reranking should proceed, with a short
+ * human-readable `reason` string for logging/debugging.
+ */
+export function shouldTriggerRerank(
+  query: string,
+  candidates: Array<{ score: number }>,
+  varianceThreshold: number,
+  complexityWordThreshold: number,
+): { trigger: boolean; reason: string } {
+  // Complexity check: long queries benefit more from cross-attention scoring.
+  if (complexityWordThreshold > 0) {
+    const wordCount = query.trim().split(/\s+/).length;
+    if (wordCount >= complexityWordThreshold) {
+      return {
+        trigger: true,
+        reason: `complex query (${wordCount} words >= threshold ${complexityWordThreshold})`,
+      };
+    }
+  }
+
+  // Variance check: low variance means scores are ambiguous → rerank needed.
+  if (varianceThreshold > 0 && candidates.length >= 2) {
+    const scores = candidates.map((c) => c.score);
+    const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const variance =
+      scores.reduce((acc, s) => acc + (s - mean) ** 2, 0) / scores.length;
+
+    if (variance < varianceThreshold) {
+      return {
+        trigger: true,
+        reason: `ambiguous ranking — score variance ${variance.toFixed(4)} < threshold ${varianceThreshold}`,
+      };
+    }
+    return {
+      trigger: false,
+      reason: `top result clearly dominant — score variance ${variance.toFixed(4)} >= threshold ${varianceThreshold}`,
+    };
+  }
+
+  // Neither threshold configured — fall through to rerank.
+  return { trigger: true, reason: "adaptive thresholds not configured" };
 }
 
 // ============================================================================
@@ -480,15 +572,12 @@ export class MemoryRetriever {
       (r) => r.score >= this.config.minScore,
     );
 
-    // Rerank if enabled
-    const reranked =
-      this.config.rerank !== "none"
-        ? await this.rerankResults(
-          query,
-          queryVector,
-          filtered.slice(0, limit * 2),
-        )
-        : filtered;
+    // Rerank if enabled (adaptive mode may skip cross-encoder to save latency)
+    const reranked = await this.maybeRerank(
+      query,
+      queryVector,
+      filtered.slice(0, limit * 2),
+    );
 
     const temporallyRanked = this.decayEngine
       ? reranked
@@ -639,6 +728,40 @@ export class MemoryRetriever {
 
     // Sort by fused score descending
     return fusedResults.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Conditionally invoke the reranker based on the `rerankAdaptive` config.
+   *
+   * - When `rerankAdaptive` is false (default): always rerank, same as before.
+   * - When `rerankAdaptive` is true: call `shouldTriggerRerank` first.
+   *   If the check says skip, the candidates are returned as-is (no API call,
+   *   no lightweight cosine fallback either — the RRF fusion score is trusted).
+   *   If the check says trigger, delegate to `rerankResults` as normal.
+   */
+  private async maybeRerank(
+    query: string,
+    queryVector: number[],
+    candidates: RetrievalResult[],
+  ): Promise<RetrievalResult[]> {
+    if (this.config.rerank === "none") return candidates;
+
+    if (this.config.rerankAdaptive) {
+      const { trigger, reason } = shouldTriggerRerank(
+        query,
+        candidates,
+        this.config.rerankVarianceThreshold ?? 0.04,
+        this.config.rerankComplexityWordThreshold ?? 8,
+      );
+      if (!trigger) {
+        // Log at debug level so operators can verify adaptive decisions.
+        console.debug(`memory-lancedb-pro: rerank skipped — ${reason}`);
+        return candidates;
+      }
+      console.debug(`memory-lancedb-pro: rerank triggered — ${reason}`);
+    }
+
+    return this.rerankResults(query, queryVector, candidates);
   }
 
   /**
